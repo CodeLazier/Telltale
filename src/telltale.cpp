@@ -1,4 +1,4 @@
-// imetip.cpp — 中文输入法光标徽标 (Windows 11 / 微软拼音)
+// telltale.cpp — 中文输入法光标徽标 Telltale (Windows 11 / 微软拼音)
 //
 // 判据(实测):
 //   HKL 低字 == 0x0804  且  (ConversionMode & IME_CMODE_NATIVE)
@@ -12,10 +12,7 @@
 //   - 中文态时在插入符旁显示徽标 (分层窗口, 点击穿透, 不抢焦点)
 //   - 前台进入全屏时暂停, 退出全屏后恢复
 //
-// Build:
-//   windres -I src -O coff src\app.rc -o app.rc.o
-//   g++ -std=c++17 -O2 -municode -mwindows -static -o imetip.exe src\imetip.cpp app.rc.o ^
-//       -limm32 -luser32 -lgdi32 -lshell32 -lshcore -lgdiplus -ladvapi32 -lole32
+// Build: 见 build.bat
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -57,15 +54,16 @@ static const UINT WM_TRAY = WM_APP + 1;
 enum MenuId : UINT {
     IDM_ENABLE = 100,
     IDM_ONLY_EDGE,
+    IDM_PAUSE_FULLSCREEN,
     IDM_AUTOSTART,
     IDM_EXIT,
 };
 
-static const wchar_t* kOverlayClass = L"ImeTipOverlay";
-static const wchar_t* kTrayClass = L"ImeTipTray";
+static const wchar_t* kOverlayClass = L"TelltaleOverlay";
+static const wchar_t* kTrayClass = L"TelltaleTray";
 
-static const int kAppIconRes = 101;      // src\app.rc 里的 dribble.ico
-static const wchar_t* kAppIconFile = L"dribble.ico";
+static const int kAppIconRes = 101;      // src\app.rc 里的 sun.ico
+static const wchar_t* kAppIconFile = L"sun.ico";
 
 // ---------------------------------------------------------------- 全局
 
@@ -78,14 +76,16 @@ static ULONG_PTR g_gdiToken = 0;
 
 static bool g_enabled = true;    // 总开关
 static bool g_onlyEdge = true;   // 仅在 Processes 列表中的进程生效
+static bool g_pauseFullscreen = true; // 全屏时暂停; 关闭则只按焦点判断
 static bool g_autoStart = true;  // 开机自启
 static std::vector<std::wstring> g_processes;  // 允许显示徽标的进程名, 来自 ini
 static const wchar_t* kDefaultProcesses = L"msedge.exe,Cursor.exe,Code.exe";
 static bool g_preview = false;   // --preview: 强制显示, 用于调试
 static bool g_noTray = false;    // --no-tray: 调试用, 跳过托盘
-static bool g_debug = false;     // --debug: 状态变化写日志
+static bool g_debug = false;     // ini Debug=1 才写日志
 static bool g_visible = false;
 static bool g_chinese = false;   // 最近一次确定的中文态
+static bool g_fullscreen = false; // 前台全屏, 暂停显示
 
 static int g_w = 0, g_h = 0;
 static int g_dpi = 96;
@@ -111,8 +111,10 @@ static std::wstring ExePath() {
     return std::wstring(buf, n);
 }
 
-// 调试日志: 与 exe 同目录的 imetip.exe.log (UTF-8)
+// 调试日志: 与 exe 同目录的 telltale.exe.log (UTF-8)。Debug=0 时什么都不写。
 static void Log(const wchar_t* fmt, ...) {
+    if (!g_debug) return;
+
     wchar_t msg[1024] = {};
     va_list ap;
     va_start(ap, fmt);
@@ -133,18 +135,28 @@ static void Log(const wchar_t* fmt, ...) {
     fclose(f);
 }
 
+static DWORD g_cachedPid = 0;
+static std::wstring g_cachedName;
+
+// 前台进程没变就用上次的文件名, 避免每 80ms 都 OpenProcess
 static std::wstring ProcessName(DWORD pid) {
-    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!h) return L"";
-    wchar_t buf[MAX_PATH] = {};
-    DWORD n = MAX_PATH;
+    if (pid == 0) return L"";
+    if (pid == g_cachedPid) return g_cachedName;
+
     std::wstring name;
-    if (QueryFullProcessImageNameW(h, 0, buf, &n)) {
-        std::wstring full(buf, n);
-        size_t p = full.find_last_of(L'\\');
-        name = (p == std::wstring::npos) ? full : full.substr(p + 1);
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (h) {
+        wchar_t buf[MAX_PATH] = {};
+        DWORD n = MAX_PATH;
+        if (QueryFullProcessImageNameW(h, 0, buf, &n)) {
+            std::wstring full(buf, n);
+            size_t p = full.find_last_of(L'\\');
+            name = (p == std::wstring::npos) ? full : full.substr(p + 1);
+        }
+        CloseHandle(h);
     }
-    CloseHandle(h);
+    g_cachedPid = pid;
+    g_cachedName = name;
     return name;
 }
 
@@ -336,10 +348,12 @@ static ImeState QueryIme() {
     HWND ime = ImmGetDefaultIMEWnd(fg);
     if (!ime) return ImeState::Unknown;
 
+    // 轮询间隔只有 80ms, 超时太长会把托盘线程卡住。失败则保持上一次的中英文状态。
+    const UINT kImeQueryMs = 50;
     DWORD_PTR result = 0;
     if (!SendMessageTimeoutW(ime, WM_IME_CONTROL, IMC_GETCONVERSIONMODE, 0,
-                             SMTO_ABORTIFHUNG, 500, &result)) {
-        return ImeState::Unknown;  // 不要猜成英文
+                             SMTO_ABORTIFHUNG, kImeQueryMs, &result)) {
+        return ImeState::Unknown;
     }
     return (result & IME_CMODE_NATIVE) ? ImeState::Chinese : ImeState::English;
 }
@@ -519,6 +533,44 @@ static void HideOverlay() {
     ShowWindow(g_overlay, SW_HIDE);
 }
 
+// 盖住整块屏幕才算全屏。任务栏还在时, 普通最大化窗口盖不到任务栏。
+// 任务栏自动隐藏时, 用有没有标题栏把最大化和无边框全屏分开。
+static bool IsFullscreenApp() {
+    QUERY_USER_NOTIFICATION_STATE quns = QUNS_NOT_PRESENT;
+    if (SUCCEEDED(SHQueryUserNotificationState(&quns)) &&
+        quns == QUNS_RUNNING_D3D_FULL_SCREEN) {
+        return true;
+    }
+
+    HWND fg = GetForegroundWindow();
+    if (!fg || fg == g_overlay || fg == g_tray || !IsWindowVisible(fg) || IsIconic(fg))
+        return false;
+
+    wchar_t cls[64] = {};
+    GetClassNameW(fg, cls, 64);
+    if (wcscmp(cls, L"Progman") == 0 || wcscmp(cls, L"WorkerW") == 0)
+        return false;
+
+    HMONITOR mon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
+    if (!mon) return false;
+    MONITORINFO mi = {};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(mon, &mi)) return false;
+
+    RECT wr = {};
+    if (!GetWindowRect(fg, &wr)) return false;
+    const int tol = 8;
+    const RECT& m = mi.rcMonitor;
+    bool covers = wr.left <= m.left + tol && wr.top <= m.top + tol &&
+                   wr.right >= m.right - tol && wr.bottom >= m.bottom - tol;
+    if (!covers) return false;
+
+    if (!EqualRect(&mi.rcMonitor, &mi.rcWork)) return true;
+
+    LONG style = GetWindowLongW(fg, GWL_STYLE);
+    return (style & WS_CAPTION) == 0;
+}
+
 static void ApplyState() {
     if (g_preview) {
         const bool show = g_enabled;
@@ -527,6 +579,23 @@ static void ApplyState() {
         else if (!show && g_visible) HideOverlay();
         else if (show && g_visible) PlaceOverlay();
         return;
+    }
+
+    if (!g_enabled) {
+        if (g_visible) HideOverlay();
+        return;
+    }
+
+    if (g_pauseFullscreen) {
+        bool full = IsFullscreenApp();
+        if (full != g_fullscreen) {
+            g_fullscreen = full;
+            if (g_debug) Log(L"fullscreen pause=%d", full ? 1 : 0);
+        }
+        if (full) {
+            if (g_visible) HideOverlay();
+            return;
+        }
     }
 
     ImeState s = QueryIme();
@@ -613,23 +682,23 @@ static bool IniExists() {
 }
 
 static int IniGet(const wchar_t* key, int def) {
-    return (int)GetPrivateProfileIntW(L"ImeTip", key, (UINT)def, IniPath().c_str());
+    return (int)GetPrivateProfileIntW(L"Telltale", key, (UINT)def, IniPath().c_str());
 }
 
 static void IniSet(const wchar_t* key, int value) {
     wchar_t buf[16] = {};
     swprintf(buf, 16, L"%d", value);
-    WritePrivateProfileStringW(L"ImeTip", key, buf, IniPath().c_str());
+    WritePrivateProfileStringW(L"Telltale", key, buf, IniPath().c_str());
 }
 
 static std::wstring IniGetStr(const wchar_t* key, const wchar_t* def) {
     wchar_t buf[4096] = {};
-    GetPrivateProfileStringW(L"ImeTip", key, def, buf, ARRAYSIZE(buf), IniPath().c_str());
+    GetPrivateProfileStringW(L"Telltale", key, def, buf, ARRAYSIZE(buf), IniPath().c_str());
     return buf;
 }
 
 static void IniSetStr(const wchar_t* key, const std::wstring& value) {
-    WritePrivateProfileStringW(L"ImeTip", key, value.c_str(), IniPath().c_str());
+    WritePrivateProfileStringW(L"Telltale", key, value.c_str(), IniPath().c_str());
 }
 
 static bool IsListSpace(wchar_t c) {
@@ -667,11 +736,13 @@ static std::wstring JoinProcessList(const std::vector<std::wstring>& names) {
 static void SaveSettings() {
     IniSet(L"Enabled", g_enabled ? 1 : 0);
     IniSet(L"OnlyEdge", g_onlyEdge ? 1 : 0);
+    IniSet(L"PauseFullscreen", g_pauseFullscreen ? 1 : 0);
     IniSet(L"AutoStart", g_autoStart ? 1 : 0);
+    IniSet(L"Debug", g_debug ? 1 : 0);
     IniSetStr(L"Processes", JoinProcessList(g_processes));
-    Log(L"ini saved enabled=%d onlyEdge=%d autoStart=%d processes=%s path=%s",
-        g_enabled ? 1 : 0, g_onlyEdge ? 1 : 0, g_autoStart ? 1 : 0,
-        JoinProcessList(g_processes).c_str(), IniPath().c_str());
+    Log(L"ini saved enabled=%d onlyEdge=%d pauseFullscreen=%d autoStart=%d debug=%d processes=%s path=%s",
+        g_enabled ? 1 : 0, g_onlyEdge ? 1 : 0, g_pauseFullscreen ? 1 : 0, g_autoStart ? 1 : 0,
+        g_debug ? 1 : 0, JoinProcessList(g_processes).c_str(), IniPath().c_str());
 }
 
 static void LoadProcessList() {
@@ -687,11 +758,36 @@ static void LoadProcessList() {
     g_processes = ParseProcessList(s);
 }
 
+static void LoadPauseFullscreen() {
+    const wchar_t* kMissing = L"\x1";
+    std::wstring s = IniGetStr(L"PauseFullscreen", kMissing);
+    if (s == kMissing) {
+        g_pauseFullscreen = true;
+        IniSet(L"PauseFullscreen", 1);
+        Log(L"ini pauseFullscreen defaulted");
+        return;
+    }
+    g_pauseFullscreen = IniGet(L"PauseFullscreen", 1) != 0;
+}
+
+static void LoadDebug() {
+    const wchar_t* kMissing = L"\x1";
+    std::wstring s = IniGetStr(L"Debug", kMissing);
+    if (s == kMissing) {
+        g_debug = false;
+        IniSet(L"Debug", 0);
+        return;
+    }
+    g_debug = IniGet(L"Debug", 0) != 0;
+}
+
 static void LoadSettings() {
     if (!IniExists()) {
         g_enabled = true;
         g_onlyEdge = true;
+        g_pauseFullscreen = true;
         g_autoStart = true;
+        g_debug = false;
         g_processes = ParseProcessList(kDefaultProcesses);
         SaveSettings();
         Log(L"ini created: %s", IniPath().c_str());
@@ -700,10 +796,12 @@ static void LoadSettings() {
     g_enabled   = IniGet(L"Enabled", 1) != 0;
     g_onlyEdge  = IniGet(L"OnlyEdge", 1) != 0;
     g_autoStart = IniGet(L"AutoStart", 1) != 0;
+    LoadDebug();
+    LoadPauseFullscreen();
     LoadProcessList();
-    Log(L"ini loaded enabled=%d onlyEdge=%d autoStart=%d processes=%s path=%s",
-        g_enabled ? 1 : 0, g_onlyEdge ? 1 : 0, g_autoStart ? 1 : 0,
-        JoinProcessList(g_processes).c_str(), IniPath().c_str());
+    Log(L"ini loaded enabled=%d onlyEdge=%d pauseFullscreen=%d autoStart=%d debug=%d processes=%s path=%s",
+        g_enabled ? 1 : 0, g_onlyEdge ? 1 : 0, g_pauseFullscreen ? 1 : 0, g_autoStart ? 1 : 0,
+        g_debug ? 1 : 0, JoinProcessList(g_processes).c_str(), IniPath().c_str());
 }
 
 // ---------------------------------------------------------------- 开机自启
@@ -716,7 +814,7 @@ static std::wstring StartupLnkPath() {
     }
     std::wstring p = path;
     if (!p.empty() && p.back() != L'\\') p += L'\\';
-    return p + L"ImeTip.lnk";
+    return p + L"Telltale.lnk";
 }
 
 static bool WriteStartupShortcut() {
@@ -737,7 +835,7 @@ static bool WriteStartupShortcut() {
     link->SetPath(exe.c_str());
     link->SetArguments(L"--autostart");
     link->SetWorkingDirectory(dir.c_str());
-    link->SetDescription(L"ImeTip - 中文输入法插入符提示");
+    link->SetDescription(L"Telltale - 中文输入时在插入符旁提示");
 
     IPersistFile* pf = nullptr;
     bool ok = false;
@@ -772,7 +870,9 @@ static void ShowMenu() {
     if (!menu) return;
 
     AppendMenuW(menu, MF_STRING | (g_enabled ? MF_CHECKED : 0), IDM_ENABLE, L"显示状态标");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (g_onlyEdge ? MF_CHECKED : 0), IDM_ONLY_EDGE, L"仅指定进程");
+    AppendMenuW(menu, MF_STRING | (g_pauseFullscreen ? MF_CHECKED : 0), IDM_PAUSE_FULLSCREEN, L"全屏时暂停");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (g_autoStart ? MF_CHECKED : 0), IDM_AUTOSTART, L"开机自启");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -816,6 +916,12 @@ static LRESULT CALLBACK TrayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         case IDM_ONLY_EDGE:
             g_onlyEdge = !g_onlyEdge;
+            SaveSettings();
+            ApplyState();
+            break;
+        case IDM_PAUSE_FULLSCREEN:
+            g_pauseFullscreen = !g_pauseFullscreen;
+            if (!g_pauseFullscreen) g_fullscreen = false;
             SaveSettings();
             ApplyState();
             break;
@@ -907,7 +1013,7 @@ static HICON MakeIcon(int sz) {
     return icon;
 }
 
-// 程序图标: 先取编进 exe 的 dribble.ico 资源, 再取 exe 同目录的 dribble.ico,
+// 程序图标: 先取编进 exe 的 sun.ico 资源, 再取 exe 同目录的 sun.ico,
 // 都没有才退回代码绘制的 "中" 图标
 static HICON LoadAppIcon(int sz) {
     HICON icon = (HICON)LoadImageW(g_hInst, MAKEINTRESOURCEW(kAppIconRes),
@@ -942,7 +1048,7 @@ static bool CreateTray() {
         return false;
     }
 
-    g_tray = CreateWindowExW(WS_EX_TOOLWINDOW, kTrayClass, L"ImeTip",
+    g_tray = CreateWindowExW(WS_EX_TOOLWINDOW, kTrayClass, L"Telltale",
                              WS_OVERLAPPED, 0, 0, 0, 0,
                              nullptr, nullptr, g_hInst, nullptr);
     if (!g_tray) return false;
@@ -954,7 +1060,7 @@ static bool CreateTray() {
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAY;
     nid.hIcon = g_icon;
-    wcsncpy(nid.szTip, L"ImeTip - 中文输入法可视化", ARRAYSIZE(nid.szTip) - 1);
+    wcsncpy(nid.szTip, L"Telltale - 中文模式亮一下", ARRAYSIZE(nid.szTip) - 1);
 
     BOOL added = FALSE;
     DWORD trayErr = 0;
@@ -970,6 +1076,14 @@ static bool CreateTray() {
     }
     Log(L"Shell_NotifyIcon add=%d err=%lu tray=%p icon=%p noTray=%d cbSize=%zu",
         added, trayErr, g_tray, g_icon, g_noTray ? 1 : 0, sizeof(NOTIFYICONDATAW));
+
+    if (!g_noTray && !added) {
+        MessageBoxW(nullptr,
+                    L"托盘图标创建失败，程序将退出。\n"
+                    L"请运行安装目录里的 telltale.exe，不要从「下载」文件夹启动。",
+                    L"Telltale", MB_OK | MB_ICONERROR);
+        return false;
+    }
 
     SetTimer(g_tray, kTimerFollow, 16, nullptr);
     SetTimer(g_tray, kTimerPoll, 80, nullptr);
@@ -1009,19 +1123,20 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         for (int i = 1; i < argc; ++i) {
             if (wcscmp(argv[i], L"--preview") == 0) g_preview = true;
             if (wcscmp(argv[i], L"--no-tray") == 0) g_noTray = true;
-            if (wcscmp(argv[i], L"--debug") == 0) g_debug = true;
         }
         LocalFree(argv);
     }
 
     // 单实例
-    g_mutex = CreateMutexW(nullptr, FALSE, L"Local\\ImeTip.SingleInstance");
+    g_mutex = CreateMutexW(nullptr, FALSE, L"Local\\Telltale.SingleInstance");
     if (g_mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
         CloseHandle(g_mutex);
         return 0;
     }
 
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+    LoadSettings();
 
     if (HMODULE shcore = LoadLibraryW(L"shcore.dll")) {
         g_pGetDpiForMonitor =
@@ -1057,14 +1172,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         return 1;
     }
 
-    LoadSettings();
     if (!g_preview) {
         ApplyAutoStart(g_autoStart);  // 同步启动文件夹快捷方式
     }
 
     if (!CreateOverlay() || !CreateTray()) {
         Log(L"create failed overlay=%p tray=%p", g_overlay, g_tray);
-        if (g_overlay) DestroyWindow(g_overlay);
+        if (g_tray) DestroyWindow(g_tray);
+        else if (g_overlay) DestroyWindow(g_overlay);
         if (g_uia) { g_uia->Release(); g_uia = nullptr; }
         if (SUCCEEDED(ole)) OleUninitialize();
         GdiplusShutdown(g_gdiToken);
@@ -1091,4 +1206,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     GdiplusShutdown(g_gdiToken);
     if (g_mutex) {
         CloseHandle(g_mutex);
- 
+        g_mutex = nullptr;
+    }
+    Log(L"exit");
+    return 0;
+}

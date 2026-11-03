@@ -127,4 +127,4 @@ Processes=msedge.exe,Cursor.exe,Code.exe,notepad.exe,chrome.exe
 1. 托盘菜单里选「退出」。
 2. 删除 `%LOCALAPPDATA%\Programs\Telltale`。这里面有 exe、ini，以及 `Debug=1` 时生成的日志。
 3. 如果开过开机自启，删除启动文件夹里的 `Telltale.lnk`。
-4. 如果用过改名前的 ImeTip，再删掉 `%LOCALAPPDATA%\Programs\ImeTip`、启动文件夹里的 `ImeTip.lnk`，以及注册表里的 `HKCU\Software\ImeTip` 和 Run 下的 `ImeTip`。当前版本不写注册表。
+4. 当前版本不写注册表。

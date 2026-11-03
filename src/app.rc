@@ -1,0 +1,3 @@
+// 程序图标资源: 托盘图标 + exe 文件图标
+// 编进 exe (windres), 见 build.bat
+101 ICON "sun.ico"
